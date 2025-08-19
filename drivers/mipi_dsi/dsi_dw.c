@@ -15,6 +15,9 @@ LOG_MODULE_REGISTER(dsi_dw, CONFIG_MIPI_DSI_LOG_LEVEL);
 #include <zephyr/drivers/mipi_dphy/dphy_dw.h>
 #include "dsi_dw.h"
 
+/* Generic Payload FIFO max size */
+#define GENERIC_PAYLOAD_FIFO_MAX (128U * 4U)
+
 /* Utility functions. */
 static int dsi_format_to_bpp(uint8_t color_coding)
 {
@@ -991,6 +994,7 @@ static ssize_t dsi_dw_transfer(const struct device *dev,
 
 	const uint8_t *tx = msg->tx_buf;
 	uint32_t header;
+	size_t tx_send_len = msg->tx_len;
 	uint8_t param0;
 	uint8_t param1;
 	uint32_t mask;
@@ -1028,7 +1032,7 @@ static ssize_t dsi_dw_transfer(const struct device *dev,
 	case MIPI_DSI_DCS_SHORT_WRITE:
 	case MIPI_DSI_DCS_SHORT_WRITE_PARAM:
 		param0 = msg->cmd;
-		param1 = (msg->tx_len > 0) ? tx[0] : 0;
+		param1 = (tx_send_len > 0) ? tx[0] : 0;
 		header = HEADER(channel, msg->type, param0, param1);
 		ret = dsi_dw_write_hdr(regs, header);
 		if (ret)
@@ -1036,11 +1040,11 @@ static ssize_t dsi_dw_transfer(const struct device *dev,
 		break;
 	case MIPI_DSI_DCS_LONG_WRITE:
 		ret = dsi_dw_write_payload(regs, msg->cmd, tx,
-				msg->tx_len);
+				tx_send_len);
 		if (ret)
 			return ret;
-		param0 = msg->tx_len + 1;
-		param1 = (msg->tx_len + 1) >> 8;
+		param0 = tx_send_len + 1;
+		param1 = (tx_send_len + 1) >> 8;
 
 		header = HEADER(channel, msg->type, param0, param1);
 		ret = dsi_dw_write_hdr(regs, header);
@@ -1061,22 +1065,23 @@ static ssize_t dsi_dw_transfer(const struct device *dev,
 	case MIPI_DSI_GENERIC_SHORT_WRITE_0_PARAM:
 	case MIPI_DSI_GENERIC_SHORT_WRITE_1_PARAM:
 	case MIPI_DSI_GENERIC_SHORT_WRITE_2_PARAM:
-		param0 = (msg->tx_len > 0) ? tx[0] : 0;
-		param1 = (msg->tx_len > 1) ? tx[1] : 0;
+		param0 = (tx_send_len > 0) ? tx[0] : 0;
+		param1 = (tx_send_len > 1) ? tx[1] : 0;
 		header = HEADER(channel, msg->type, param0, param1);
 		ret = dsi_dw_write_hdr(regs, header);
 		if (ret)
 			return ret;
 		break;
 	case MIPI_DSI_GENERIC_LONG_WRITE:
-		if (msg->tx_len >= 1) {
+		tx_send_len = MIN(tx_send_len, GENERIC_PAYLOAD_FIFO_MAX - 4);
+		if (tx_send_len >= 1) {
 			ret = dsi_dw_write_payload(regs, tx[0],
-					tx + 1, msg->tx_len - 1);
+					tx + 1, tx_send_len - 1);
 			if (ret)
 				return ret;
 		}
-		param0 = msg->tx_len;
-		param1 = msg->tx_len >> 8;
+		param0 = tx_send_len;
+		param1 = tx_send_len >> 8;
 		header = HEADER(channel, msg->type, param0, param1);
 		ret = dsi_dw_write_hdr(regs, header);
 		if (ret)
@@ -1087,10 +1092,12 @@ static ssize_t dsi_dw_transfer(const struct device *dev,
 		return -EINVAL;
 	}
 
-	if (msg->rx_buf && msg->rx_len)
+	if (msg->rx_buf && msg->rx_len) {
 		dsi_dw_read_payload(regs, msg->rx_buf, msg->rx_len);
+		return msg->rx_len;
+	}
 
-	return 0;
+	return tx_send_len;
 }
 
 /* ISR Function */

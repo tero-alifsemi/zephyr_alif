@@ -226,7 +226,7 @@ static int mw405_configure(const struct device *dev)
 					&init_cmds[i].arg.cmd.data,
 					1);
 		}
-		if (ret)
+		if (ret < 0)
 			return ret;
 	}
 
@@ -255,14 +255,14 @@ static int mw405_configure(const struct device *dev)
 
 	ret = mipi_dsi_dcs_write(config->mipi_dsi, config->channel,
 			MIPI_DCS_SET_PIXEL_FORMAT, &tmp, 1);
-	if (ret) {
+	if (ret < 0) {
 		return ret;
 	}
 
 	/* Exit sleep Mode. */
 	ret = mipi_dsi_dcs_write(config->mipi_dsi, config->channel,
 			MIPI_DCS_EXIT_SLEEP_MODE, NULL, 0);
-	if (ret)
+	if (ret < 0)
 		return ret;
 
 	/*
@@ -275,7 +275,7 @@ static int mw405_configure(const struct device *dev)
 	/* Display On. */
 	ret = mipi_dsi_dcs_write(config->mipi_dsi, config->channel,
 			MIPI_DCS_SET_DISPLAY_ON, NULL, 0);
-	if (ret)
+	if (ret < 0)
 		return ret;
 
 	return 0;
@@ -346,7 +346,7 @@ static int mw405_set_orientation(const struct device *dev,
 	}
 	ret = mipi_dsi_dcs_write(config->mipi_dsi,
 			config->channel, MIPI_DCS_DISPLAY_ACCESS_CMD, &tmp, 1);
-	if (ret)
+	if (ret < 0)
 		LOG_ERR("Failed to set orientation of panel.");
 	else
 		data->orientation = orientation;
