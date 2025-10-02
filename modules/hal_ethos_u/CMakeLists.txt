@@ -28,6 +28,25 @@ if(CONFIG_ARM_ETHOS_U AND CONFIG_MULTITHREADING)
         )
     endif()
 
+    # Ethos-U55 and Ethos-U65 supports up to 128 bytes,
+    # and Ethos-U85 supports up to 256 bytes.
+    # Although, this is system implementation dependent the platforms we build for should support the
+    # maximum burst length for all NPU configurations.
+
+    target_compile_definitions(ethosu_core_driver PUBLIC
+        AXI_LIMIT0_MAX_BEATS_BYTES=1
+        AXI_LIMIT1_MAX_BEATS_BYTES=1
+        AXI_LIMIT2_MAX_BEATS_BYTES=1
+        AXI_LIMIT3_MAX_BEATS_BYTES=1) # 0 = 64 byte burst & 1 = 128 byte burst
+
+
+    # Use "normal" (modifiable) transactions, improving interconnect transit
+    target_compile_definitions(ethosu_core_driver PUBLIC
+        AXI_LIMIT0_MEM_TYPE=2
+        AXI_LIMIT1_MEM_TYPE=2
+        AXI_LIMIT2_MEM_TYPE=2
+        AXI_LIMIT3_MEM_TYPE=2) # 2 = Normal Non-cacheable Non-bufferable
+
     target_link_libraries(ethosu_core_driver PUBLIC
        zephyr_interface)
 
