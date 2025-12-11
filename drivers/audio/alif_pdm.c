@@ -310,6 +310,24 @@ static int dmic_alif_pdm_read(const struct device *dev, uint8_t stream, void **b
 	return rc;
 }
 
+static inline void pdm_error_handler(const struct device *dev)
+{
+	uintptr_t reg_base = DEVICE_MMIO_GET(dev);
+
+	sys_clear_bits(reg_base + PDM_INTERRUPT_REGISTER, PDM_FIFO_OVERFLOW_IRQ);
+	(void)sys_read32(reg_base + PDM_ERROR_IRQ);
+}
+
+static inline void pdm_audio_det_handler(const struct device *dev)
+{
+	struct pdm_data *pdata = DEV_DATA(dev);
+	uintptr_t reg_base = DEVICE_MMIO_GET(dev);
+
+	if (pdata->slab_missed != 0) {
+		sys_clear_bits(reg_base + PDM_INTERRUPT_REGISTER, PDM_AUDIO_DETECT_IRQ_STAT);
+	}
+	(void)sys_read32(reg_base + PDM_AUDIO_DETECT_IRQ);
+}
 /**
  * @fn		static void pdm_error_detect_irq_handler()
  * @brief	ISR to handle the error interrupt
@@ -318,10 +336,7 @@ static int dmic_alif_pdm_read(const struct device *dev, uint8_t stream, void **b
  */
 static __maybe_unused void pdm_error_detect_irq_handler(const struct device *dev)
 {
-	uintptr_t reg_base = DEVICE_MMIO_GET(dev);
-
-	sys_clear_bits(reg_base + PDM_INTERRUPT_REGISTER, PDM_FIFO_OVERFLOW_IRQ);
-	(void)sys_read32(reg_base + PDM_ERROR_IRQ);
+	pdm_error_handler(dev);
 }
 
 /**
@@ -332,13 +347,7 @@ static __maybe_unused void pdm_error_detect_irq_handler(const struct device *dev
  */
 static __maybe_unused void pdm_audio_detect_irq_handler(const struct device *dev)
 {
-	struct pdm_data *pdata = DEV_DATA(dev);
-	uintptr_t reg_base = DEVICE_MMIO_GET(dev);
-
-	if (pdata->slab_missed != 0) {
-		sys_clear_bits(reg_base + PDM_INTERRUPT_REGISTER, PDM_AUDIO_DETECT_IRQ_STAT);
-	}
-	(void)sys_read32(reg_base + PDM_AUDIO_DETECT_IRQ);
+	pdm_audio_det_handler(dev);
 }
 
 /**
@@ -404,6 +413,15 @@ static void alif_pdm_warning_isr(const struct device *dev)
 
 	intstatus = sys_read32(reg_base + PDM_WARN_IRQ);
 	num_items = sys_read32(reg_base + PDM_FIFO_STATUS_REGISTER);
+
+	/* LPPDM doesn't have separate error and audio detect isr handlers */
+	if(!DT_NODE_HAS_PROP(DT_NODELABEL(dev), error_intr)) {
+		pdm_error_handler(dev);
+	}
+
+	if(!DT_NODE_HAS_PROP(DT_NODELABEL(dev), audio_det_intr)) {
+		pdm_audio_det_handler(dev);
+	}
 
 	for (i = 0; i < num_items; i++) {
 		audio_ch_0_1 = sys_read32(reg_base + PDM_CH0_CH1_AUDIO_OUT);
