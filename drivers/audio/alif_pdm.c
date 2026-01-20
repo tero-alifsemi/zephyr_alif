@@ -20,16 +20,14 @@
 #define AUDIO_BUF_SIZE 128
 #define BURST_LEN      0
 #define DATA_LEN       4
+#define MAX_HW_CHANS   4
 
-#if 0
 // For Balletto
-#define LPPDM_DMA_REQUEST 30
-#define LPPDM_DMA_GROUP   2
-#else
+#define BALLETTO_DMA_REQUEST 30
+#define BALLETTO_DMA_GROUP   2
 // For Ensemble
-#define LPPDM_DMA_REQUEST 19
-#define LPPDM_DMA_GROUP   0
-#endif
+#define ENSEMBLE_DMA_REQUEST 19
+#define ENSEMBLE_DMA_GROUP   0
 
 #define USE_DMA_HANDSHAKE (1U << 24U)
 
@@ -72,7 +70,8 @@ struct pdm_config {
 	const struct lppdm_dma_ch dma;
 };
 
-static uint16_t audio_buff[AUDIO_BUF_SIZE];
+static uint16_t audio_buffer[MAX_HW_CHANS][AUDIO_BUF_SIZE];
+static uint16_t audio_out[MAX_HW_CHANS * AUDIO_BUF_SIZE];
 /**
  * @fn		int dmic_alif_pdm_configure(const struct device *dev,
  *						struct dmic_cfg *config)
@@ -264,16 +263,15 @@ static void disable_interrupt(const struct device *dev)
 
 static void *get_slab(struct pdm_data *pdm_data);
 
-static void write_buffer(const struct device *const dev)
+static void write_buffer(const struct device *const dev, uint16_t *audio_buff, uint32_t channels)
 {
 	struct pdm_data *pdmdata = DEV_DATA(dev);
 	uint32_t block_size = pdmdata->block_size;
 	uint32_t bytes_available;
 	uint32_t whole;
+	uint32_t hw_channels = channels / 2;
 
-	uint32_t data_bytes = AUDIO_BUF_SIZE * sizeof(unsigned short);
-
-	pdmdata->bytes_got += data_bytes;
+	uint32_t data_bytes = AUDIO_BUF_SIZE * sizeof(unsigned short) * hw_channels;
 
 	if (pdmdata->data_buffer == NULL) {
 
@@ -310,11 +308,28 @@ static void write_buffer(const struct device *const dev)
 	}
 }
 
+void interleave_pcm(const uint16_t in[][AUDIO_BUF_SIZE],
+		    uint16_t out[MAX_HW_CHANS * AUDIO_BUF_SIZE], int channels, int channel)
+{
+	int frame;
+	int out_idx = 2 * channel;
+	int offset = channels - 2;
+
+	if (channels == 0) {
+		return;
+	}
+	for (frame = 0; frame < AUDIO_BUF_SIZE; frame += 2) {
+		out[out_idx++] = in[channel][frame];     // Left
+		out[out_idx++] = in[channel][frame + 1]; // Right
+		out_idx += offset;
+	}
+}
+
 static void dma_rx_callback(const struct device *dma_dev, void *p_user_data, uint32_t const channel,
 			    int const status)
 {
 	const struct device *const dev = p_user_data;
-	struct pdm_config *dev_cfg = DEV_CFG(dev);
+	static uint8_t chan_ready = 0;
 	int ret;
 
 	if (status < 0) {
@@ -322,47 +337,32 @@ static void dma_rx_callback(const struct device *dma_dev, void *p_user_data, uin
 		return;
 	}
 
-	write_buffer(dev);
+	chan_ready += 2;
 
-	ret = dma_start(dma_dev, dev_cfg->dma.ch);
+	interleave_pcm(audio_buffer, audio_out, DEV_DATA(dev)->num_channels, channel);
+
+	if (chan_ready == DEV_DATA(dev)->num_channels) {
+		chan_ready = 0;
+		write_buffer(dev, audio_out, DEV_DATA(dev)->num_channels);
+	}
+
+	ret = dma_start(dma_dev, channel);
 	if (ret < 0) {
 		LOG_ERR("PDM: dma_start failed %d", ret);
 		return;
 	}
 }
 
-static uint16_t buffer_offset(const struct device *const dev)
+static int start_dma(const struct device *const dev, uintptr_t offset, uintptr_t buffer,
+		     uint32_t ch)
 {
-	struct pdm_data *pdata = DEV_DATA(dev);
-
-	if (pdata->channel_map & 0x03) {
-		LOG_DBG("CH0");
-		return PDM_CH0_CH1_AUDIO_OUT;
-	} else if (pdata->channel_map & 0x0C) {
-		LOG_DBG("CH1");
-		return PDM_CH2_CH3_AUDIO_OUT;
-	} else if (pdata->channel_map & 0x30) {
-		LOG_DBG("CH2");
-		return PDM_CH4_CH5_AUDIO_OUT;
-	} else if (pdata->channel_map & 0xC0) {
-		LOG_DBG("CH3");
-		return PDM_CH6_CH7_AUDIO_OUT;
-	}
-
-	LOG_ERR("Chan offset failed");
-	return 0;
-}
-
-static int trigger_pdm_dma(const struct device *const dev)
-{
+	int ret;
 	uintptr_t reg_base = DEVICE_MMIO_GET(dev);
-	struct pdm_config *dev_cfg = DEV_CFG(dev);
-	const struct device *dma_dev = DEVICE_DT_GET(DT_NODELABEL(dma2));
-	int ret = 0;
+	const struct device *dma_dev = DEVICE_DT_GET(DT_NODELABEL(dma2)); // todo use defined dma
 
 	struct dma_block_config dma_block_cfg = {
-		.source_address = POINTER_TO_UINT((reg_base + buffer_offset(dev))),
-		.dest_address = POINTER_TO_UINT(audio_buff),
+		.source_address = reg_base + offset,
+		.dest_address = buffer,
 		.block_size = AUDIO_BUF_SIZE * sizeof(unsigned short),
 		.source_addr_adj = DMA_ADDR_ADJ_NO_CHANGE,
 		.dest_addr_adj = DMA_ADDR_ADJ_INCREMENT,
@@ -375,24 +375,54 @@ static int trigger_pdm_dma(const struct device *const dev)
 		.dest_data_size = DATA_LEN,
 		.source_burst_length = BURST_LEN,
 		.dest_burst_length = BURST_LEN,
-		.head_block = &dma_block_cfg,
+		.head_block = NULL,
 		.user_data = (void *)dev,
+		.head_block = &dma_block_cfg,
 		.dma_callback = dma_rx_callback,
 	};
 
-	ret = dma_config(dma_dev, dev_cfg->dma.ch, &dma_cfg);
+	ret = dma_config(dma_dev, ch, &dma_cfg);
+	ret |= dma_start(dma_dev, ch);
 	if (ret < 0) {
-		LOG_ERR("PDM dma_config failed %d", ret);
-		return ret;
+		LOG_ERR("PDM: dma conf and start failed %d", ret);
 	}
 
-	ret = dma_start(dma_dev, dev_cfg->dma.ch);
-	if (ret < 0) {
-		LOG_ERR("PDM: dma_start failed %d", ret);
-		return ret;
+	return ret;
+}
+
+static int trigger_pdm_dma(const struct device *const dev)
+{
+	uint8_t i = 0;
+	uint32_t channel_base = DEV_CFG(dev)->dma.ch;
+	struct pdm_data *pdata = DEV_DATA(dev);
+	int ret = 0;
+
+	if (pdata->channel_map & 0x03) {
+		LOG_DBG("CH0 dma chan:%d", DEV_CFG(dev)->dma.ch + i);
+		start_dma(dev, PDM_CH0_CH1_AUDIO_OUT, POINTER_TO_UINT(audio_buffer[i]),
+			  channel_base + i);
+		i++;
+	}
+	if (pdata->channel_map & 0x0C) {
+		LOG_DBG("CH1 dma chan:%d", DEV_CFG(dev)->dma.ch + i);
+		start_dma(dev, PDM_CH2_CH3_AUDIO_OUT, POINTER_TO_UINT(audio_buffer[i]),
+			  channel_base + i);
+		i++;
+	}
+	if (pdata->channel_map & 0x30) {
+		LOG_DBG("CH2 dma chan:%d", DEV_CFG(dev)->dma.ch + i);
+		start_dma(dev, PDM_CH4_CH5_AUDIO_OUT, POINTER_TO_UINT(audio_buffer[i]),
+			  channel_base + i);
+		i++;
+	}
+	if (pdata->channel_map & 0xC0) {
+		LOG_DBG("CH3 dma chan:%d", DEV_CFG(dev)->dma.ch + i);
+		start_dma(dev, PDM_CH6_CH7_AUDIO_OUT, POINTER_TO_UINT(audio_buffer[i]),
+			  channel_base + i);
+		i++;
 	}
 
-	LOG_DBG("PDM: dma started.");
+	LOG_DBG("PDM: dma started %d.", DEV_CFG(dev)->dma.request);
 
 	return ret;
 }
@@ -412,14 +442,17 @@ static int dmic_alif_pdm_trigger(const struct device *dev, enum dmic_trigger cmd
 	struct pdm_config *cfg = DEV_CFG(dev);
 	uintptr_t reg_base = DEVICE_MMIO_GET(dev);
 	int ret;
+	int i;
 
 	switch (cmd) {
 	case DMIC_TRIGGER_STOP:
 		disable_interrupt(dev);
-		ret = dma_stop(DEVICE_DT_GET(DT_NODELABEL(dma2)), cfg->dma.ch);
-		if (ret < 0) {
-			LOG_ERR("PDM: dma_start failed %d", ret);
-			return ret;
+		for (i = 0; i < pdata->num_channels / 2; i++) {
+			ret = dma_stop(DEVICE_DT_GET(DT_NODELABEL(dma2)), cfg->dma.ch + i);
+			if (ret < 0) {
+				LOG_ERR("PDM: dma_stop failed %d", ret);
+				return ret;
+			}
 		}
 		pdata->record_data = 0;
 		break;
@@ -432,7 +465,7 @@ static int dmic_alif_pdm_trigger(const struct device *dev, enum dmic_trigger cmd
 		pdata->slab_missed = 0;
 
 		if (cfg->dma.enabled) {
-			trigger_pdm_dma(dev); // todo: trigger dma first, then pdm
+			trigger_pdm_dma(dev);
 			LOG_DBG("trigger DMA");
 		} else {
 			enable_interrupt(dev);
@@ -678,6 +711,10 @@ static int pdm_initialize(const struct device *dev)
 	struct pdm_data *pdata = DEV_DATA(dev);
 	int32_t ret = 0;
 	uint32_t regdata;
+	uint32_t request = cfg->dma.request;
+	uint32_t group;
+
+	group = (request == BALLETTO_DMA_REQUEST) ? BALLETTO_DMA_GROUP : ENSEMBLE_DMA_GROUP;
 
 	DEVICE_MMIO_MAP(dev, K_MEM_CACHE_NONE);
 
@@ -712,7 +749,7 @@ static int pdm_initialize(const struct device *dev)
 	regdata = pdata->bypass_iir_filter << PDM_BYPASS_IIR;
 
 	if (cfg->dma.enabled) {
-		ret = dma_event_router_configure(LPPDM_DMA_GROUP, LPPDM_DMA_REQUEST, true);
+		ret = dma_event_router_configure(group, request, true);
 		if (ret != 0) {
 			LOG_ERR("dma event router config fail:%d", ret);
 			return ret;
@@ -754,8 +791,8 @@ static const struct _dmic_ops dmic_alif_pdm_api = {
 		.clk_dev = DEVICE_DT_GET(DT_INST_CLOCKS_CTLR(n)),                                  \
 		.clkid = (clock_control_subsys_t)DT_INST_CLOCKS_CELL(n, clkid),                    \
 		.dma.enabled = 1,                                                                  \
-		.dma.ch = DT_INST_DMAS_CELL_BY_NAME(n, pdmdma, channel),                           \
-		.dma.request = DT_INST_DMAS_CELL_BY_NAME(n, pdmdma, periph),                       \
+		.dma.ch = DT_INST_DMAS_CELL_BY_NAME(n, pdm_dma_1, channel),                        \
+		.dma.request = DT_INST_DMAS_CELL_BY_NAME(n, pdm_dma_1, periph),                    \
 	};                                                                                         \
 	static void pdm_irq_config_##n(void)                                                       \
 	{                                                                                          \
