@@ -10,11 +10,12 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/irq.h>
 #include <zephyr/init.h>
+#include <zephyr/kernel.h>
 #include <zephyr/drivers/pinctrl.h>
 #include "alif_pdm_reg.h"
 #include <zephyr/drivers/clock_control.h>
 
-LOG_MODULE_REGISTER(alif_pdm, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(alif_pdm, LOG_LEVEL_DBG);
 
 #define DEV_DATA(dev) ((struct pdm_data *)((dev)->data))
 #define DEV_CFG(dev)  ((const struct pdm_config *)((dev)->config))
@@ -32,6 +33,9 @@ struct pdm_data {
 	uint32_t record_data;
 	uint32_t bytes_got;
 	uint8_t bypass_iir_filter;
+	uint32_t sampling_rate;
+	struct k_timer pdm_timer;
+	const struct device *dev;
 	void *queue_data[MAX_QUEUE_LEN];
 	uint16_t data[MAX_NUM_CHANNELS * MAX_DATA_ITEMS];
 };
@@ -62,7 +66,7 @@ static int dmic_alif_pdm_configure(const struct device *dev, struct dmic_cfg *co
 	uint32_t reg_val = sys_read32(reg_base + PDM_CONFIG_REGISTER);
 
 	if (config->channel.req_num_chan == 0 || config->channel.req_num_chan > MAX_NUM_CHANNELS) {
-		LOG_DBG("config invalid: number of channels not valid\n");
+		LOG_DBG("config invalid: number of channels not valid");
 		return -EINVAL;
 	}
 
@@ -78,10 +82,10 @@ static int dmic_alif_pdm_configure(const struct device *dev, struct dmic_cfg *co
 
 		pdata->num_channels = config->channel.req_num_chan;
 
-		LOG_DBG("block size: %d\n", pdata->block_size);
+		LOG_DBG("block size: %d", pdata->block_size);
 	}
 
-	LOG_DBG("DMIC configure okay\n");
+	LOG_DBG("DMIC configure okay");
 
 	return 0;
 }
@@ -188,6 +192,37 @@ void pdm_set_peak_detect_itv(const struct device *dev, uint8_t ch_num, uint32_t 
 }
 
 /**
+ * @fn		uint32_t pdm_mode_to_sampling_rate(uint8_t mode)
+ * @brief	Converts PDM mode to baseband sampling rate
+ * @param[in]	mode	: PDM mode (0-9)
+ * @return	Sampling rate in Hz, or 0 for invalid/sleep mode
+ */
+static uint32_t pdm_mode_to_sampling_rate(uint8_t mode)
+{
+	switch (mode) {
+	case 0:
+		return 0; /* Microphone sleep */
+	case 1:
+		return 8000; /* Standard voice */
+	case 2:
+	case 3:
+	case 4:
+		return 16000; /* High-quality voice / Wide-bandwidth audio */
+	case 5:
+		return 32000; /* Wide-bandwidth audio */
+	case 6:
+	case 7:
+		return 48000; /* Full-bandwidth audio */
+	case 8:
+		return 96000; /* Full-bandwidth audio */
+	case 9:
+		return 192000; /* Ultrasound */
+	default:
+		return 0;
+	}
+}
+
+/**
  * @fn		void pdm_mode(const struct device *dev, uint8_t mode)
  * @brief	Sets the PDM modes
  * @param[in]	dev	: Pointer to the runtime device structure.
@@ -196,6 +231,7 @@ void pdm_set_peak_detect_itv(const struct device *dev, uint8_t ch_num, uint32_t 
  */
 void pdm_mode(const struct device *dev, uint8_t mode)
 {
+	struct pdm_data *pdata = DEV_DATA(dev);
 	uintptr_t reg_base = DEVICE_MMIO_GET(dev);
 
 	uint32_t reg_val = sys_read32(reg_base + PDM_CONFIG_REGISTER);
@@ -203,6 +239,8 @@ void pdm_mode(const struct device *dev, uint8_t mode)
 	reg_val |= (mode << PDM_CLK_MODE);
 
 	sys_write32(reg_val, reg_base + PDM_CONFIG_REGISTER);
+
+	pdata->sampling_rate = pdm_mode_to_sampling_rate(mode);
 }
 
 /**
@@ -211,7 +249,7 @@ void pdm_mode(const struct device *dev, uint8_t mode)
  * @param[in]	dev : Pointer to the runtime device structure.
  * @return	None
  */
-static void enable_interrupt(const struct device *dev)
+__maybe_unused static void enable_interrupt(const struct device *dev)
 {
 	uintptr_t reg_base = DEVICE_MMIO_GET(dev);
 	uint32_t irq_value = 0;
@@ -254,22 +292,32 @@ static void disable_interrupt(const struct device *dev)
 static int dmic_alif_pdm_trigger(const struct device *dev, enum dmic_trigger cmd)
 {
 	struct pdm_data *pdata = DEV_DATA(dev);
+	const struct pdm_config *cfg = DEV_CFG(dev);
 
 	switch (cmd) {
 	case DMIC_TRIGGER_STOP:
+		k_timer_stop(&pdata->pdm_timer);
 		disable_interrupt(dev);
 		pdata->record_data = 0;
 		break;
 
 	case DMIC_TRIGGER_START:
-		LOG_DBG("trigger start\n");
+		LOG_DBG("trigger start");
+		uint32_t watermark = cfg->fifo_watermark ? cfg->fifo_watermark : 2;
+		k_timeout_t timeout = K_USEC(1000000ULL * watermark / pdata->sampling_rate);
 		pdata->record_data = 1;
 		pdata->bytes_got = 0;
 		pdata->buf_index = 0;
 		pdata->data_buffer = NULL;
 		pdata->slab_missed = 0;
-
+#if 0
 		enable_interrupt(dev);
+#else
+		/* Start timer to poll PDM data */
+		k_timer_start(&pdata->pdm_timer, timeout, timeout);
+		LOG_DBG("poll timer started: timeout=%u us, watermark=%u",
+			(uint32_t)k_ticks_to_us_floor32(timeout.ticks), watermark);
+#endif
 		break;
 
 	default:
@@ -303,7 +351,7 @@ static int dmic_alif_pdm_read(const struct device *dev, uint8_t stream, void **b
 	rc = k_msgq_get(&pdata->buf_queue, buffer, SYS_TIMEOUT_MS(timeout));
 
 	if (rc != 0) {
-		LOG_DBG("No audio data to be read\n");
+		LOG_DBG("No audio data to be read");
 	} else {
 		*size = pdata->block_size;
 	}
@@ -366,13 +414,27 @@ static void *get_slab(struct pdm_data *pdm_data)
 	rc = k_mem_slab_alloc(pdm_data->mem_slab, &buffer, K_NO_WAIT);
 
 	if (rc == 0) {
-		LOG_DBG("Memory block allocated : %p\n", buffer);
+		// LOG_DBG("Memory block allocated : %p", buffer);
 	} else {
 		pdm_data->slab_missed++;
 		return NULL;
 	}
 
 	return buffer;
+}
+
+static void alif_pdm_warning_isr(const struct device *dev);
+
+/**
+ * @fn		static void pdm_timer_callback()
+ * @brief	Timer callback that periodically calls the PDM ISR handler
+ * @param[in]	timer	: pointer to timer structure
+ * @return	None.
+ */
+static void pdm_timer_callback(struct k_timer *timer)
+{
+	struct pdm_data *pdmdata = CONTAINER_OF(timer, struct pdm_data, pdm_timer);
+	alif_pdm_warning_isr(pdmdata->dev);
 }
 
 /**
@@ -414,12 +476,16 @@ static void alif_pdm_warning_isr(const struct device *dev)
 	intstatus = sys_read32(reg_base + PDM_WARN_IRQ);
 	num_items = sys_read32(reg_base + PDM_FIFO_STATUS_REGISTER);
 
+	if (num_items == 0) {
+		printk("X\n");
+	}
+
 	/* LPPDM doesn't have separate error and audio detect isr handlers */
-	if(!DT_NODE_HAS_PROP(DT_NODELABEL(dev), error_intr)) {
+	if (!DT_NODE_HAS_PROP(DT_NODELABEL(dev), error_intr)) {
 		pdm_error_handler(dev);
 	}
 
-	if(!DT_NODE_HAS_PROP(DT_NODELABEL(dev), audio_det_intr)) {
+	if (!DT_NODE_HAS_PROP(DT_NODELABEL(dev), audio_det_intr)) {
 		pdm_audio_det_handler(dev);
 	}
 
@@ -480,8 +546,8 @@ static void alif_pdm_warning_isr(const struct device *dev)
 		pdmdata->buf_index += data_bytes;
 	} else {
 		if (bytes_available > 0) {
-			memcpy((pdmdata->data_buffer + pdmdata->buf_index),
-				pdmdata->data, bytes_available);
+			memcpy((pdmdata->data_buffer + pdmdata->buf_index), pdmdata->data,
+			       bytes_available);
 		}
 		whole = data_bytes - bytes_available;
 
@@ -520,8 +586,7 @@ static int pdm_initialize(const struct device *dev)
 	}
 
 	/* Configure PDM clock sources */
-	ret = clock_control_configure(cfg->clk_dev,
-						cfg->clkid, NULL);
+	ret = clock_control_configure(cfg->clk_dev, cfg->clkid, NULL);
 	if (ret != 0) {
 		LOG_ERR("Unable to configure clock: err:%d", ret);
 		return ret;
@@ -538,12 +603,16 @@ static int pdm_initialize(const struct device *dev)
 
 	k_msgq_init(&pdata->buf_queue, (char *)pdata->queue_data, sizeof(void *), MAX_QUEUE_LEN);
 
+	/* Initialize timer for periodic PDM polling */
+	pdata->dev = dev;
+	k_timer_init(&pdata->pdm_timer, pdm_timer_callback, NULL);
+
 	/* Enable the Bypass IIR Filter */
 	sys_write32(pdata->bypass_iir_filter << PDM_BYPASS_IIR, reg_base + PDM_CTL_REGISTER);
 
 	sys_write32(cfg->fifo_watermark, reg_base + PDM_THRESHOLD_REGISTER);
 
-	LOG_INF("alif pdm driver init okay\n");
+	LOG_INF("alif pdm driver init okay");
 
 	return 0;
 }
@@ -569,30 +638,27 @@ static const struct _dmic_ops dmic_alif_pdm_api = {
 		.irq_config = pdm_irq_config_##n,                                                  \
 		.pcfg = PINCTRL_DT_INST_DEV_CONFIG_GET(n),                                         \
 		.clk_dev = DEVICE_DT_GET(DT_INST_CLOCKS_CTLR(n)),                                  \
-		.clkid = (clock_control_subsys_t) DT_INST_CLOCKS_CELL(n, clkid),                   \
+		.clkid = (clock_control_subsys_t)DT_INST_CLOCKS_CELL(n, clkid),                    \
 	};                                                                                         \
 	static void pdm_irq_config_##n(void)                                                       \
 	{                                                                                          \
 		IRQ_CONNECT(DT_INST_IRQ_BY_NAME(n, warning_intr, irq),                             \
-				DT_INST_IRQ_BY_NAME(n, warning_intr, priority),                    \
-				alif_pdm_warning_isr, DEVICE_DT_INST_GET(n), 0);                   \
+			    DT_INST_IRQ_BY_NAME(n, warning_intr, priority), alif_pdm_warning_isr,  \
+			    DEVICE_DT_INST_GET(n), 0);                                             \
 		irq_enable(DT_INST_IRQ_BY_NAME(n, warning_intr, irq));                             \
-		IF_ENABLED(DT_INST_IRQ_HAS_NAME(n, error_intr), (                                  \
-		IRQ_CONNECT(DT_INST_IRQ_BY_NAME(n, error_intr, irq),                               \
-				DT_INST_IRQ_BY_NAME(n, error_intr, priority),                      \
-				pdm_error_detect_irq_handler, DEVICE_DT_INST_GET(n), 0);           \
-		irq_enable(DT_INST_IRQ_BY_NAME(n, error_intr, irq));                               \
-		)) \
-		IF_ENABLED(DT_INST_IRQ_HAS_NAME(n, audio_det_intr), (                              \
-		IRQ_CONNECT(DT_INST_IRQ_BY_NAME(n, audio_det_intr, irq),                           \
-				DT_INST_IRQ_BY_NAME(n, audio_det_intr, priority),                  \
-				pdm_audio_detect_irq_handler, DEVICE_DT_INST_GET(n), 0);           \
-		irq_enable(DT_INST_IRQ_BY_NAME(n, audio_det_intr, irq));                           \
-		)) \
+		IF_ENABLED(DT_INST_IRQ_HAS_NAME(n, error_intr),                                    \
+			   (IRQ_CONNECT(DT_INST_IRQ_BY_NAME(n, error_intr, irq),                   \
+					DT_INST_IRQ_BY_NAME(n, error_intr, priority),              \
+					pdm_error_detect_irq_handler, DEVICE_DT_INST_GET(n), 0);   \
+			    irq_enable(DT_INST_IRQ_BY_NAME(n, error_intr, irq));))                 \
+		IF_ENABLED(DT_INST_IRQ_HAS_NAME(n, audio_det_intr),                                \
+			   (IRQ_CONNECT(DT_INST_IRQ_BY_NAME(n, audio_det_intr, irq),               \
+					DT_INST_IRQ_BY_NAME(n, audio_det_intr, priority),          \
+					pdm_audio_detect_irq_handler, DEVICE_DT_INST_GET(n), 0);   \
+			    irq_enable(DT_INST_IRQ_BY_NAME(n, audio_det_intr, irq));))             \
 	}                                                                                          \
 	DEVICE_DT_INST_DEFINE(n, pdm_initialize, NULL, &dmic_alif_pdm_data,                        \
-				&dmic_alif_pdm_cfg_##n, POST_KERNEL,                               \
-				CONFIG_AUDIO_DMIC_INIT_PRIORITY,                                   \
-				&dmic_alif_pdm_api);
+			      &dmic_alif_pdm_cfg_##n, POST_KERNEL,                                 \
+			      CONFIG_AUDIO_DMIC_INIT_PRIORITY, &dmic_alif_pdm_api);
 
 DT_INST_FOREACH_STATUS_OKAY(PDM_INIT)
