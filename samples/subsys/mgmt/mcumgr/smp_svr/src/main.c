@@ -56,7 +56,7 @@ int main(void)
 				    "smp_svr_stats");
 
 	if (rc < 0) {
-		LOG_ERR("Error initializing stats system [%d]", rc);
+		LOG_ERR("Error  initializing stats system [%d]", rc);
 	}
 
 	/* Register the built-in mcumgr command handlers. */
