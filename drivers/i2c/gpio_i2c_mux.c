@@ -123,6 +123,9 @@ static int i2c_mux_init(const struct device *dev)
 	struct i2c_mux_data *data = dev->data;
 	int ret;
 
+	/* Re-initialize the mutex explicitly to handle warm resets/boot. */
+	k_mutex_init(&data->lock);
+
 	if (!device_is_ready(cfg->ctrl_gpio.port)) {
 		LOG_ERR("I2C Multiplexer\'s Control GPIO is not ready!");
 		return -ENODEV;

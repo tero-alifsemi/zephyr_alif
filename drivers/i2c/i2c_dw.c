@@ -594,6 +594,68 @@ done:
 	i2c_dw_transfer_complete(port);
 }
 
+static void i2c_dw_wait_disable(uint32_t reg_base)
+{
+	/* Per DW I2C spec, IC_CON and other registers must only be written
+	 * when IC_ENABLE_STATUS[0] is 0. Poll until IC is fully disabled.
+	 */
+	for (int i = 0; i < 100; i++) {
+		if (!test_bit_enable_status_ic_en(reg_base)) {
+			return;
+		}
+		k_busy_wait(1);
+	}
+	LOG_WRN("I2C: timeout waiting for IC disable");
+}
+
+static void i2c_dw_abort_and_disable(uint32_t reg_base)
+{
+	/* If the IC is still enabled (e.g. after sys_reboot()), trigger an
+	 * ABORT before disabling. Per DW spec, setting IC_ENABLE[1] while
+	 * IC_ENABLE[0]=1 causes the master to generate a STOP condition on
+	 * the bus and terminate any in-progress transfer. This frees the
+	 * I2C bus from a potentially inconsistent state left by the previous
+	 * boot. After the abort completes, hardware auto-clears both bit 1
+	 * (ABORT) and bit 0 (ENABLE).
+	 */
+	printk("1:EN=%08x STAT=%08x "
+		"RAW_INT=%08x CON=%08x\n",
+		sys_read32(reg_base + DW_IC_REG_ENABLE),
+		sys_read32(reg_base + DW_IC_REG_STATUS),
+		sys_read32(reg_base + 0x34),
+		sys_read32(reg_base + DW_IC_REG_CON));
+
+	if (sys_read32(reg_base + DW_IC_REG_ENABLE) & IC_ENABLE_BIT) {
+		sys_write32(IC_ENABLE_BIT | BIT(1), reg_base + DW_IC_REG_ENABLE);
+		for (int i = 0; i < 250; i++) {
+			if (!(sys_read32(reg_base + DW_IC_REG_ENABLE) & BIT(1))) {
+				break;
+			}
+			k_busy_wait(1);
+		}
+		printk("2:EN=%08x RAW_INT=%08x\n",
+			sys_read32(reg_base + DW_IC_REG_ENABLE),
+			sys_read32(reg_base + 0x34));
+		/* Clear all interrupt state while IC is still enabled.
+		 * Per DW spec, IC_CLR_INTR and IC_CLR_TX_ABRT only take
+		 * effect when IC_ENABLE[0]=1; clearing after disable is
+		 * unreliable and leaves stale bits in IC_RAW_INTR_STAT.
+		 */
+		write_intr_mask(0, reg_base);
+		(void)read_clr_intr(reg_base);
+		(void)read_clr_tx_abrt(reg_base);
+	}
+	clear_bit_enable_en(reg_base);
+	i2c_dw_wait_disable(reg_base);
+	printk("3:EN=%08x EN_STAT=%08x "
+		"STAT=%08x RAW_INT=%08x\n",
+		sys_read32(reg_base + DW_IC_REG_ENABLE),
+		sys_read32(reg_base + DW_IC_REG_ENABLE_STATUS),
+		sys_read32(reg_base + DW_IC_REG_STATUS),
+		sys_read32(reg_base + 0x34));
+}
+
+
 static int i2c_dw_setup(const struct device *dev, uint16_t slave_address)
 {
 	const struct i2c_dw_rom_config * const rom = dev->config;
@@ -607,12 +669,32 @@ static int i2c_dw_setup(const struct device *dev, uint16_t slave_address)
 
 	/* Disable the device controller to be able set TAR */
 	clear_bit_enable_en(reg_base);
+	i2c_dw_wait_disable(reg_base);
+
+	/* Wait for controller to fully stop (required per DW I2C spec when
+	 * bus was active, e.g. after sys_reboot mid-transfer).
+	 */
+	k_timepoint_t timeout = sys_timepoint_calc(K_MSEC(500));
+
+	while (test_bit_status_activity(reg_base)) {
+		if (sys_timepoint_expired(timeout)) {
+			LOG_ERR("I2C: controller did not stop, IC_STATUS=%08x",
+				sys_read32(reg_base + DW_IC_REG_STATUS));
+			return -ETIMEDOUT;
+		}
+		k_busy_wait(1);
+	}
 
 	/* Disable interrupts */
 	write_intr_mask(0, reg_base);
 
-	/* Clear interrupts */
+	/* Clear any interrupts that accumulated while IC was disabled.
+	 * Note: the authoritative clear (while IC is enabled) was already
+	 * done in i2c_dw_abort_and_disable(); this is a belt-and-suspenders
+	 * flush for the current disable→reconfigure cycle.
+	 */
 	value = read_clr_intr(reg_base);
+	read_clr_tx_abrt(reg_base);
 
 	/* Set master or slave mode - (initialization = slave) */
 	if (I2C_MODE_CONTROLLER & dw->app_config) {
@@ -753,6 +835,8 @@ static int i2c_dw_transfer(const struct device *dev, struct i2c_msg *msgs, uint8
 
 	ret = i2c_dw_setup(dev, slave_address);
 	if (ret) {
+		printk("I2C setup failed: %d IC_STATUS=%08x\n", ret,
+			sys_read32(reg_base + DW_IC_REG_STATUS));
 		goto error;
 	}
 
@@ -1202,7 +1286,7 @@ static int i2c_dw_initialize(const struct device *dev)
 
 	uint32_t reg_base = get_regs(dev);
 
-	clear_bit_enable_en(reg_base);
+	i2c_dw_abort_and_disable(reg_base);
 
 	/* verify that we have a valid DesignWare register first */
 	if (read_comp_type(reg_base) != I2C_DW_MAGIC_KEY) {
@@ -1240,6 +1324,12 @@ static int i2c_dw_initialize(const struct device *dev)
 
 	dw->state = I2C_DW_STATE_READY;
 
+	printk("8:CON=%08x EN=%08x STAT=%08x RAW_INT=%08x INT_MSK=%08x\n",
+		sys_read32(reg_base + DW_IC_REG_CON),
+		sys_read32(reg_base + DW_IC_REG_ENABLE),
+		sys_read32(reg_base + DW_IC_REG_STATUS),
+		sys_read32(reg_base + 0x34),
+		sys_read32(reg_base + DW_IC_REG_INTR_MASK));
 	return ret;
 }
 
