@@ -16,6 +16,7 @@
 #include <zephyr/usb/class/usbd_uac2.h>
 #include <zephyr/drivers/i2s.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/audio/codec.h>
 
 LOG_MODULE_REGISTER(uac2_sample, LOG_LEVEL_INF);
 
@@ -35,7 +36,7 @@ LOG_MODULE_REGISTER(uac2_sample, LOG_LEVEL_INF);
  * offset errors), but add 2 additional buffers to prevent out of memory errors
  * when USB host decides to perform rapid terminal enable/disable cycles.
  */
-#define I2S_BUFFERS_COUNT   7
+#define I2S_BUFFERS_COUNT   20
 K_MEM_SLAB_DEFINE_STATIC(i2s_tx_slab, ROUND_UP(MAX_BLOCK_SIZE, UDC_BUF_GRANULARITY),
 			 I2S_BUFFERS_COUNT, UDC_BUF_ALIGN);
 
@@ -259,6 +260,37 @@ int main(void)
 	struct usbd_context *sample_usbd;
 	struct i2s_config config;
 	int ret;
+
+	const struct device *codec_dev = DEVICE_DT_GET(DT_ALIAS(audio_codec));
+
+	if (!device_is_ready(codec_dev)) {
+		printk("%s is not ready\n", codec_dev->name);
+		return 0;
+	}
+
+	/* Configure codec */
+	struct audio_codec_cfg codec_cfg = {
+		.dai_type = AUDIO_DAI_TYPE_I2S,
+		.dai_cfg = {
+			.i2s = {
+				.word_size = SAMPLE_BIT_WIDTH,
+				.channels = NUMBER_OF_CHANNELS,
+				.format = I2S_FMT_DATA_FORMAT_I2S,
+				.options = 0,
+				.frame_clk_freq = SAMPLE_FREQUENCY,
+				.mem_slab = NULL,
+				.block_size = 0,
+				.timeout = 0,
+			},
+		},
+	};
+
+	ret = audio_codec_configure(codec_dev, &codec_cfg);
+	if (ret) {
+		LOG_ERR("Failed to configure sink codec. err %d", ret);
+		return ret;
+	}
+	audio_codec_start_output(codec_dev);
 
 	main_ctx.i2s_dev = DEVICE_DT_GET(DT_NODELABEL(i2s_tx));
 
