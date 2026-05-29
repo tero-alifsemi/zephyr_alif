@@ -396,6 +396,7 @@ static int32_t udc_dwc3_stop_transfer(udc_dwc3_driver_t *drv, uint8_t ep_num,
 		trb_ptr->ctrl = 0;
 	}
 	ept->trb_enqueue = 0;
+	ept->trb_dequeue = 0;
 	if (force_rm == 1) {
 		ept->ep_resource_index = 0U;
 	}
@@ -492,6 +493,8 @@ static int32_t udc_dwc3_isoc_send(udc_dwc3_driver_t *drv, uint8_t ep_num, uint8_
 		 */
 		SET_BIT(trb_ptr->ctrl, USB_TRB_CTRL_HWO | USB_TRB_CTRL_IOC | USB_TRB_CTRL_ISP_IMI);
 		sys_cache_data_flush_range(trb_ptr, sizeof(*trb_ptr));
+		SET_BIT(ept->ep_status, USB_EP_ISOC_START_PENDING);
+		ept->isoc_start_retries = 20;
 	}
 
 	if ((ept->ep_status & USB_EP_BUSY) != 0U) {
@@ -650,6 +653,8 @@ static int32_t udc_dwc3_isoc_recv(udc_dwc3_driver_t *drv, uint8_t ep_num, uint8_
 		 */
 		SET_BIT(trb_ptr->ctrl, USB_TRB_CTRL_HWO | USB_TRB_CTRL_IOC | USB_TRB_CTRL_ISP_IMI);
 		sys_cache_data_flush_range(trb_ptr, sizeof(*trb_ptr));
+		SET_BIT(ept->ep_status, USB_EP_ISOC_START_PENDING);
+		ept->isoc_start_retries = 20;
 	}
 
 	return 0;
@@ -1087,12 +1092,27 @@ static void udc_dwc3_depevt_handler(udc_dwc3_driver_t *drv, uint32_t reg)
 				udc_dwc3_ep_t *xnr_ept = &drv->eps[endp_number];
 
 				if (!(xnr_ept->ep_status & USB_EP_BUSY) &&
-				    xnr_ept->trb_enqueue != xnr_ept->trb_dequeue) {
+				    (xnr_ept->ep_status & USB_EP_ISOC_START_PENDING)) {
 					udc_dwc3_ep_params_t xnr_params = {0};
 					udc_dwc3_trb_t *xnr_trb;
 					uint32_t xnr_cmd;
 					uint32_t frame;
 					int32_t xnr_ret;
+
+					/* Rate-limit: only attempt StartTransfer
+					 * every 8th XferNotReady event (~1ms at HS)
+					 * to avoid starving EP0 processing.
+					 */
+					if (xnr_ept->isoc_start_retries == 0) {
+						CLEAR_BIT(xnr_ept->ep_status,
+							  USB_EP_ISOC_START_PENDING);
+						break;
+					}
+					if ((xnr_ept->isoc_start_retries % 8) != 0) {
+						xnr_ept->isoc_start_retries--;
+						break;
+					}
+					xnr_ept->isoc_start_retries--;
 
 					xnr_trb = &xnr_ept->ep_trb[xnr_ept->trb_dequeue];
 					xnr_params.param1 = (uint32_t)xnr_trb;
@@ -1122,9 +1142,11 @@ static void udc_dwc3_depevt_handler(udc_dwc3_driver_t *drv, uint32_t reg)
 								drv, xnr_ept->ep_index,
 								xnr_ept->ep_dir);
 						SET_BIT(xnr_ept->ep_status, USB_EP_BUSY);
+						CLEAR_BIT(xnr_ept->ep_status,
+							  USB_EP_ISOC_START_PENDING);
 					}
-					/* On Bus Expiry failure, do nothing — the next
-					 * XferNotReady event will retry automatically.
+					/* On failure, counter continues decrementing
+					 * until next eligible attempt or exhaustion.
 					 */
 				}
 			}

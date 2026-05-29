@@ -97,6 +97,7 @@ extern   "C" {
 #define USB_EP_WEDGE                                  (0x00000001U << 2U)
 #define USB_EP_BUSY                                   (0x00000001U << 4U)
 #define USB_EP_PENDING_REQUEST                        (0x00000001U << 5U)
+#define USB_EP_ISOC_START_PENDING                     (0x00000001U << 7U)
 #define USB_EP_MISSED_ISOC                            (0x00000001U << 6U)
 
 /* DEPXFERCFG parameter 0 */
@@ -180,6 +181,7 @@ typedef struct udc_dwc3_ep {
 	uint32_t    unaligned_txed;
 	uint8_t     ep_interval;
 	uint32_t    interval_uframe;
+	uint8_t     isoc_start_retries;
 } udc_dwc3_ep_t;
 
 /* USB setup packet structure */

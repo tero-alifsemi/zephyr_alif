@@ -22,21 +22,27 @@ LOG_MODULE_REGISTER(uac2_sample, LOG_LEVEL_INF);
 
 #define HEADPHONES_OUT_TERMINAL_ID UAC2_ENTITY_ID(DT_NODELABEL(out_terminal))
 
-#define SAMPLE_FREQUENCY    (SAMPLES_PER_SOF * 1000)
+#define SAMPLE_FREQUENCY    48000
 #define SAMPLE_BIT_WIDTH    16
 #define NUMBER_OF_CHANNELS  2
 #define BYTES_PER_SAMPLE    DIV_ROUND_UP(SAMPLE_BIT_WIDTH, 8)
 #define BYTES_PER_SLOT      (BYTES_PER_SAMPLE * NUMBER_OF_CHANNELS)
-#define MIN_BLOCK_SIZE      ((SAMPLES_PER_SOF - 1) * BYTES_PER_SLOT)
-#define BLOCK_SIZE          (SAMPLES_PER_SOF * BYTES_PER_SLOT)
-#define MAX_BLOCK_SIZE      ((SAMPLES_PER_SOF + 1) * BYTES_PER_SLOT)
+
+/* At High-Speed, each microframe (125us) carries ~6 samples.
+ * At Full-Speed, each frame (1ms) carries ~48 samples.
+ * Use HS sizes since the board overlay enables high-speed.
+ */
+#define SAMPLES_PER_INTERVAL  6
+#define MIN_BLOCK_SIZE      ((SAMPLES_PER_INTERVAL - 1) * BYTES_PER_SLOT)
+#define BLOCK_SIZE          (SAMPLES_PER_INTERVAL * BYTES_PER_SLOT)
+#define MAX_BLOCK_SIZE      ((SAMPLES_PER_INTERVAL + 1) * BYTES_PER_SLOT)
 
 /* Absolute minimum is 5 buffers (1 actively consumed by I2S, 2nd queued as next
  * buffer, 3rd acquired by USB stack to receive data to, and 2 to handle SOF/I2S
  * offset errors), but add 2 additional buffers to prevent out of memory errors
  * when USB host decides to perform rapid terminal enable/disable cycles.
  */
-#define I2S_BUFFERS_COUNT   20
+#define I2S_BUFFERS_COUNT   32
 K_MEM_SLAB_DEFINE_STATIC(i2s_tx_slab, ROUND_UP(MAX_BLOCK_SIZE, UDC_BUF_GRANULARITY),
 			 I2S_BUFFERS_COUNT, UDC_BUF_ALIGN);
 
@@ -62,8 +68,11 @@ static void uac2_terminal_update_cb(const struct device *dev, uint8_t terminal,
 	 * ignore the terminal variable.
 	 */
 	__ASSERT_NO_MSG(terminal == HEADPHONES_OUT_TERMINAL_ID);
-	/* This sample is for Full-Speed only devices. */
-	__ASSERT_NO_MSG(microframes == false);
+	/* At High-Speed, microframes is true (125us intervals instead of 1ms) */
+	if (microframes) {
+		LOG_INF("Terminal %d %s (High-Speed microframes)",
+			terminal, enabled ? "enabled" : "disabled");
+	}
 
 	ctx->terminal_enabled = enabled;
 	if (ctx->i2s_started && !enabled) {
@@ -81,6 +90,9 @@ static void *uac2_get_recv_buf(const struct device *dev, uint8_t terminal,
 	struct usb_i2s_ctx *ctx = user_data;
 	void *buf = NULL;
 	int ret;
+
+	LOG_WRN("USB RX buff [%u] %u, %u", ctx->terminal_enabled, size, terminal);
+
 
 	if (terminal == HEADPHONES_OUT_TERMINAL_ID) {
 		__ASSERT_NO_MSG(size <= MAX_BLOCK_SIZE);
@@ -105,6 +117,8 @@ static void uac2_data_recv_cb(const struct device *dev, uint8_t terminal,
 	struct usb_i2s_ctx *ctx = user_data;
 	int ret;
 
+	LOG_WRN("USB RX [%u] %u, %u", ctx->terminal_enabled, size, terminal);
+
 	if (!ctx->terminal_enabled) {
 		k_mem_slab_free(&i2s_tx_slab, buf);
 		return;
@@ -121,7 +135,7 @@ static void uac2_data_recv_cb(const struct device *dev, uint8_t terminal,
 		sys_cache_data_flush_range(buf, size);
 	}
 
-	LOG_DBG("Received %d data to input terminal %d", size, terminal);
+	//LOG_WRN("Received %d data to input terminal %d", size, terminal);
 
 	ret = i2s_write(ctx->i2s_dev, buf, size);
 	if (ret < 0) {
@@ -148,6 +162,8 @@ static void uac2_buf_release_cb(const struct device *dev, uint8_t terminal,
 				void *buf, void *user_data)
 {
 	/* This sample does not send audio data so this won't be called */
+
+	LOG_WRN("USB RX rel [%u]", terminal);
 }
 
 /* Variables for debug use to facilitate simple how feedback value affects
@@ -236,7 +252,7 @@ static void uac2_sof(const struct device *dev, void *user_data)
 	 *   OUT DATA0 n+3 received from host
 	 */
 	if (!ctx->i2s_started && ctx->terminal_enabled &&
-	    ctx->i2s_blocks_written >= 2) {
+	    ctx->i2s_blocks_written >= 16) {
 		i2s_trigger(ctx->i2s_dev, I2S_DIR_TX, I2S_TRIGGER_START);
 		ctx->i2s_started = true;
 		feedback_start(ctx->fb, ctx->i2s_blocks_written);
