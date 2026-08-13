@@ -36,3 +36,10 @@ properties:
   rts-ctrl:
     type: boolean
     description: Support RTS signal controlled by SW
+
+  allow-sleep:
+    type: int
+    default: 0
+    description: When set to 1, the driver keeps the UART break condition asserted
+      across suspend/resume (uart_ns16550 sets UART_LINE_CTRL_BRK). Use for links,
+      such as HCI, that should park the line while the SoC sleeps. Defaults to 0.

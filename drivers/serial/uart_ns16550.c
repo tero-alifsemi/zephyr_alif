@@ -375,6 +375,7 @@ struct uart_ns16550_dev_config {
 	struct reset_dt_spec reset_spec;
 #endif
 	bool software_reset;
+	bool allow_sleep;
 };
 
 /** Device data structure */
@@ -2152,8 +2153,15 @@ static int uart_ns16550_resume(const struct device *dev)
 
 	ns16550_outbyte(dev_cfg, MDC(dev), mdc);
 
-	/* Clear break condition */
-	ret = uart_ns16550_line_ctrl_set(dev, UART_LINE_CTRL_BRK, 0);
+	/* Keep the break condition asserted across resume when the node allows sleep
+	 * (configure() already cleared it for the normal case).
+	 */
+	if (dev_cfg->allow_sleep) {
+		ret = uart_ns16550_line_ctrl_set(dev, UART_LINE_CTRL_BRK, 1);
+	} else {
+		ret = uart_ns16550_line_ctrl_set(dev, UART_LINE_CTRL_BRK, 0);
+	}
+
 	if (ret != 0) {
 		return ret;
 	}
@@ -2426,6 +2434,7 @@ static DEVICE_API(uart, uart_ns16550_driver_api) = {
 		IF_ENABLED(DT_INST_NODE_HAS_PROP(n, resets),                         \
 			(.reset_spec = RESET_DT_SPEC_INST_GET(n),))                  \
 		.software_reset = DT_INST_PROP(n, software_reset),	             \
+		.allow_sleep = DT_INST_PROP_OR(n, allow_sleep, 0),	             \
 
 #define UART_NS16550_COMMON_DEV_DATA_INITIALIZER(n)                                  \
 		.uart_config.baudrate = DT_INST_PROP_OR(n, current_speed, 0),        \
