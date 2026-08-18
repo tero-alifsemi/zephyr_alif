@@ -2124,12 +2124,14 @@ static int uart_ns16550_suspend(const struct device *dev)
 	}
 
 #if defined(CONFIG_UART_NS16550_LINE_CTRL)
-	/* Set break condition to signal suspend */
-	ret = uart_ns16550_line_ctrl_set(dev, UART_LINE_CTRL_BRK, 1);
-	if (ret != 0) {
-		/* Restore RTS on error */
-		uart_ns16550_line_ctrl_set(dev, UART_LINE_CTRL_RTS, 1);
-		return ret;
+	if (IS_ENABLED(CONFIG_ALIF_BLE_SLEEP_DISABLED)) {
+		/* Set break condition to signal suspend */
+		ret = uart_ns16550_line_ctrl_set(dev, UART_LINE_CTRL_BRK, 1);
+		if (ret != 0) {
+			/* Restore RTS on error */
+			uart_ns16550_line_ctrl_set(dev, UART_LINE_CTRL_RTS, 1);
+			return ret;
+		}
 	}
 #endif
 	/* Disable all interrupts */
@@ -2206,9 +2208,11 @@ static int uart_ns16550_resume(const struct device *dev)
 	ns16550_outbyte(dev_cfg, MDC(dev), mdc);
 
 	/* Clear break condition */
-	ret = uart_ns16550_line_ctrl_set(dev, UART_LINE_CTRL_BRK, 0);
-	if (ret != 0) {
-		return ret;
+	if (IS_ENABLED(CONFIG_ALIF_BLE_SLEEP_DISABLED)) {
+		ret = uart_ns16550_line_ctrl_set(dev, UART_LINE_CTRL_BRK, 0);
+		if (ret != 0) {
+			return ret;
+		}
 	}
 
 	/* Restore interrupt enable state */
