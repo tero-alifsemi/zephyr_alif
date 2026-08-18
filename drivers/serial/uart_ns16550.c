@@ -2123,15 +2123,6 @@ static int uart_ns16550_suspend(const struct device *dev)
 		return -EBUSY;
 	}
 
-#if defined(CONFIG_UART_NS16550_LINE_CTRL)
-	/* Set break condition to signal suspend */
-	ret = uart_ns16550_line_ctrl_set(dev, UART_LINE_CTRL_BRK, 1);
-	if (ret != 0) {
-		/* Restore RTS on error */
-		uart_ns16550_line_ctrl_set(dev, UART_LINE_CTRL_RTS, 1);
-		return ret;
-	}
-#endif
 	/* Disable all interrupts */
 	ns16550_outbyte(dev_cfg, IER(dev), 0x00);
 
@@ -2205,11 +2196,6 @@ static int uart_ns16550_resume(const struct device *dev)
 
 	ns16550_outbyte(dev_cfg, MDC(dev), mdc);
 
-	/* Clear break condition */
-	ret = uart_ns16550_line_ctrl_set(dev, UART_LINE_CTRL_BRK, 0);
-	if (ret != 0) {
-		return ret;
-	}
 
 	/* Restore interrupt enable state */
 	if (data->rts_ctrl) {
