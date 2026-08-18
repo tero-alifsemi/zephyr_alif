@@ -445,6 +445,8 @@ static inline void process_tx(const struct device *dev)
 		}
 	}
 
+	wake_es0(cfg->uart);
+
 	bytes = uart_fifo_fill(cfg->uart, h4->tx.buf->data, h4->tx.buf->len);
 	if (unlikely(bytes < 0)) {
 		LOG_ERR("Unable to write to UART (err %d)", bytes);
