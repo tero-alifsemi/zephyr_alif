@@ -79,6 +79,43 @@ struct hci_alif_config {
 	struct k_thread *rx_thread;
 };
 
+
+#define ES0_TX_DRAIN_TIMEOUT_MS 100
+#define ES0_TX_POLL_US          20
+
+static bool hci_alif_tx_pending(const struct device *dev)
+{
+	const struct hci_alif_config *cfg = dev->config;
+	struct hci_alif_data *h4 = dev->data;
+
+	return h4->tx.buf != NULL || !k_fifo_is_empty(&h4->tx.fifo) ||
+	       uart_irq_tx_complete(cfg->uart) == 0;
+}
+
+/* ES0 may drop CTS to enter sleep after we have already seen it asserted.
+ * Auto flow control then holds the data in the UART until ES0 wakes up on its
+ * own, so keep waking it until all queued data has been sent.
+ */
+static void hci_alif_wait_tx_drained(const struct device *dev)
+{
+	return;
+
+	const struct hci_alif_config *cfg = dev->config;
+	k_timepoint_t end = sys_timepoint_calc(K_MSEC(ES0_TX_DRAIN_TIMEOUT_MS));
+	uint32_t cts;
+
+	while (hci_alif_tx_pending(dev)) {
+		if (sys_timepoint_expired(end)) {
+			LOG_WRN("HCI TX not drained in %d ms", ES0_TX_DRAIN_TIMEOUT_MS);
+			return;
+		}
+		if (uart_line_ctrl_get(cfg->uart, UART_LINE_MODEM_CTS, &cts) == 0 && !cts) {
+			wake_es0(cfg->uart);
+		}
+		k_busy_wait(ES0_TX_POLL_US);
+	}
+}
+
 static inline void hci_alif_get_type(const struct device *dev)
 {
 	const struct hci_alif_config *cfg = dev->config;
@@ -445,6 +482,8 @@ static inline void process_tx(const struct device *dev)
 		}
 	}
 
+	wake_es0(cfg->uart);
+
 	bytes = uart_fifo_fill(cfg->uart, h4->tx.buf->data, h4->tx.buf->len);
 	if (unlikely(bytes < 0)) {
 		LOG_ERR("Unable to write to UART (err %d)", bytes);
@@ -510,10 +549,12 @@ static int hci_alif_send(const struct device *dev, struct net_buf *buf)
 
 	/* Deassert&assert rts_n, falling edge triggers wake up the RF core */
 
-	wake_es0(cfg->uart);
-
 	k_fifo_put(&h4->tx.fifo, buf);
 	uart_irq_tx_enable(cfg->uart);
+
+	// wake_es0(cfg->uart);
+
+	// hci_alif_wait_tx_drained(dev);
 
 	return 0;
 }
